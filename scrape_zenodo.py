@@ -9,9 +9,16 @@ from sqlalchemy import create_engine, Column, Integer, Text, ARRAY, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import select
 # do this:
 from sqlalchemy.orm import declarative_base
 from dotenv import load_dotenv
+
+from bs4 import BeautifulSoup
+import html
+import traceback
 
 logger = logging.getLogger(__name__)
 load_dotenv()
@@ -19,7 +26,7 @@ load_dotenv()
 # Connect to the database
 DATABASE_URL = os.environ["DATABASE_URL"]
 TABLE_NAME = os.environ["TABLE_NAME"]
-engine = create_engine(DATABASE_URL)
+# engine = create_engine(DATABASE_URL)
 Base = declarative_base()
 
 
@@ -41,7 +48,7 @@ class ZenodoRecord(Base):
     source = Column(Text)
     contributor = Column(Text)
 
-Base.metadata.create_all(engine)
+# Base.metadata.create_all(engine)
 
 # Function written by @batukav
 def retry_with_exponential_backoff(max_attempts=3, delay_seconds=1):
@@ -106,24 +113,39 @@ def generate_dates(start_date, end_date):
 
 
 def to_string(array):
-    return ";".join(array)
+    return "; ".join(array)
 
 
-def add_record(for_db, session):
-    record = session.query(ZenodoRecord).filter_by(identifier=for_db['identifier']).first()
+async def add_record(for_db, async_session):
+    try:
+        async with async_session() as session:
+            # async with session.begin():
+                print("try")
+                # record = session.query(ZenodoRecord).filter_by(identifier=for_db['identifier']).first()
+                record = insert(ZenodoRecord).values([for_db])
+                print("q")
+                for_db_no_id = for_db.copy()
+                for_db_no_id.pop("identifier")
+                # If conflict on id → update name
+                upsert_record = record.on_conflict_do_update(
+                    index_elements=["identifier"],  # conflict target
+                    set_=for_db_no_id,  # update if conflict
+                )
+                await session.execute(upsert_record)
+                await session.commit()
 
-    if record:
-        # Update existing record
-        for key, value in for_db.items():
-            setattr(record, key, value)
-    else:
-        # Insert new record
-        record = ZenodoRecord(**for_db)
-        session.add(record)
-    session.commit()
+    except Exception as e:
+        print("Failed query")
+        traceback.print_exc()
+
+
+def clean_html(text):
+    decoded = html.unescape(text)
+    clean = BeautifulSoup(decoded, "html.parser").get_text()
+    return clean
         
 
-async def process_metadata(record, session):
+async def process_metadata(rcd, async_session):
     param_set = {"creator", "identifier", "title",
             "description",
             "publisher",
@@ -134,11 +156,10 @@ async def process_metadata(record, session):
             "type",
             "date",
             "source", "contributor"}
-    identifier = int(record.header.identifier.split(":")[-1])
+    identifier = int(rcd.header.identifier.split(":")[-1])
 
-    md = record.metadata
-    
-    record = {k: to_string(v) for k, v in md.items()}
+    md = rcd.metadata
+    record = {k: "; ".join(v) for k, v in md.items()}
     record["identifier"] = identifier
     missing = param_set - set(md.keys())
     if missing != set():
@@ -146,14 +167,12 @@ async def process_metadata(record, session):
         for el in missing:
             record[el] = ""
 
-# YOU STOPPED HERE!!!
-        await asyncio.to_thread(add_record, record, session)
-        # print("added")
-        return record
-    else:
-        await asyncio.to_thread(add_record, record, session)
-        # print("added")
-        return record
+    clean_description = await asyncio.to_thread(clean_html, record["description"])
+    record["description"] = clean_description
+
+    await add_record(record, async_session)
+    print("added")
+    return record
     
 
 @retry_with_exponential_backoff(max_attempts=5, delay_seconds=2)
@@ -175,7 +194,7 @@ async def producer(q, records):
             break
         await q.put(record)
         await asyncio.sleep(0.01)
-        # print(".", end="")
+        print(".", end="")
         sys.stdout.flush()
     
     await q.join()
@@ -191,10 +210,10 @@ async def consumer(q, session):
             print("x")
             q.task_done()
             break
-
+        print("?")
         md_to_db = await process_metadata(item, session)
         
-        # print("!", end="")
+        print("!", end="")
         await asyncio.sleep(0.05)
         sys.stdout.flush()
         q.task_done()
@@ -210,7 +229,10 @@ async def main():
     start_date = date(2024, 1, 1)
     end_date = date(2024, 1, 31)
     dates = generate_dates(start_date, end_date)
-    SessionLocal = sessionmaker(bind=engine)
+
+    engine = create_async_engine(DATABASE_URL, echo=False)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
 
     for i in range(len(dates)-1):
         print(dates[i], dates[i+1])
@@ -218,18 +240,14 @@ async def main():
                                      'from': dates[i],
                                      'until': dates[i+1]})
         
-        print(f"Fetched {start_date} - {end_date}")
-
-        # CONNECTION POSTGRES
-        session = SessionLocal()
+        print(f"Fetched {dates[i]} - {dates[i+1]}")
 
         q = asyncio.Queue()
         prod = asyncio.create_task(producer(q, records))
-        cons = asyncio.create_task(consumer(q, session))
+        cons = asyncio.create_task(consumer(q, async_session))
         await prod
         await cons
-        session.commit()
-        session.close()
+
         print("Added day")
         
 
