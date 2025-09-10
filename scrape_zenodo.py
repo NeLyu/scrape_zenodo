@@ -2,7 +2,7 @@ import asyncio
 from sickle import Sickle
 import time, sys, os
 from datetime import date, timedelta
-import functools, urllib, socket
+import functools, urllib, socket, requests
 import logging
 
 from sqlalchemy import create_engine, Column, Integer, Text, ARRAY, JSON
@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy import select
-# do this:
+
 from sqlalchemy.orm import declarative_base
 from dotenv import load_dotenv
 
@@ -28,7 +28,6 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 TABLE_NAME = os.environ["TABLE_NAME"]
 # engine = create_engine(DATABASE_URL)
 Base = declarative_base()
-
 
 
 class ZenodoRecord(Base):
@@ -51,7 +50,7 @@ class ZenodoRecord(Base):
 # Base.metadata.create_all(engine)
 
 # Function written by @batukav
-def retry_with_exponential_backoff(max_attempts=3, delay_seconds=1):
+def retry_with_exponential_backoff(max_attempts=500, delay_seconds=1):
     """
     Decorator that retries a function with exponential backoff for transient network errors.
     """
@@ -64,36 +63,61 @@ def retry_with_exponential_backoff(max_attempts=3, delay_seconds=1):
                 try:
                     return func(*args, **kwargs)
 
+                except StopIteration:
+                    # Don’t retry if the iterator is exhausted
+                    raise
+
                 # --- New logic to handle non-retriable HTTP client errors ---
-                except urllib.error.HTTPError as e:
+                except (requests.exceptions.HTTPError, urllib.error.HTTPError) as e:
+                    status = None
+                    # urllib
+                    if hasattr(e, "status"):
+                        status = e.status
+                    # requests
+                    if hasattr(e, "response") and e.response is not None:
+                        status = e.response.status_code
+                    
+                    reason = getattr(e, "reason", "")
+
+                    if status is None:
+                        raise
+
                     # Check if the error is a client error (4xx) which is not likely to be resolved by a retry.
-                    if 400 <= e.code < 500:
-                        logger.error(
-                            f"Function {func.__name__} failed with non-retriable client error {e.code}: {e.reason}"
-                        )
+                    if 400 <= status < 500:
+                        print(f"Function {func.__name__} failed with non-retriable client error {status}: {reason}")
+                        # logger.error(
+                        #     f"Function {func.__name__} failed with non-retriable client error {e.code}: {e.reason}"
+                        # )
                         raise e  # Re-raise the HTTPError immediately
 
                     # For other errors (like 5xx server errors), proceed with retry logic.
-                    logger.warning(f"Caught retriable HTTPError {e.code}. Proceeding with retry...")
+                    logger.warning(f"Caught retriable HTTPError {status}. Proceeding with retry...")
                     # Fall through to the generic exception handling below.
 
-                except (urllib.error.URLError, socket.timeout) as e:
-                    # This block now primarily handles non-HTTP errors or retriable HTTP errors.
-                    pass # Fall through to the retry logic below
+                # Handle requests connection/timeouts
+                except (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout,
+                        urllib.error.URLError,
+                        socket.timeout) as e:
+                        # logger.warning(f"{func.__name__} network error: {e}, retrying...")
+                        print(f"{func.__name__} network error: {e}, retrying...")
 
                 # --- Existing retry logic ---
                 attempts += 1
                 if attempts < max_attempts:
-                    logger.warning(
-                        f"Attempt {attempts}/{max_attempts} for {func.__name__} failed. "
-                        f"Retrying in {current_delay:.1f} seconds..."
-                    )
+                    print(f"Attempt {attempts}/{max_attempts} for {func.__name__} failed. ")
+                    print(f"Retrying in {current_delay:.1f} seconds...")
+                    # logger.warning(
+                    #     f"Attempt {attempts}/{max_attempts} for {func.__name__} failed. "
+                    #     f"Retrying in {current_delay:.1f} seconds..."
+                    # )
                     time.sleep(current_delay)
                     current_delay *= 2
                 else:
-                    logger.error(
-                        f"Function {func.__name__} failed after {max_attempts} attempts."
-                    )
+                    # logger.error(
+                    #     f"Function {func.__name__} failed after {max_attempts} attempts."
+                    # )
+                    print(f"Function {func.__name__} failed after {max_attempts} attempts.")
                     # Re-raise the last exception caught to be handled by the caller
                     raise ConnectionError(
                         f"Function {func.__name__} failed after {max_attempts} attempts."
@@ -120,10 +144,10 @@ async def add_record(for_db, async_session):
     try:
         async with async_session() as session:
             # async with session.begin():
-                print("try")
+                # print("try")
                 # record = session.query(ZenodoRecord).filter_by(identifier=for_db['identifier']).first()
                 record = insert(ZenodoRecord).values([for_db])
-                print("q")
+                # print("q")
                 for_db_no_id = for_db.copy()
                 for_db_no_id.pop("identifier")
                 # If conflict on id → update name
@@ -171,19 +195,22 @@ async def process_metadata(rcd, async_session):
     record["description"] = clean_description
 
     await add_record(record, async_session)
-    print("added")
+    # print("added")
     return record
     
 
-@retry_with_exponential_backoff(max_attempts=5, delay_seconds=2)
+@retry_with_exponential_backoff(max_attempts=500, delay_seconds=2)
 def get_next_record(records):
     try:
         result = next(records)
-    except Exception as e:
+        return result
+    except StopIteration as e:
         print(e)
         print("######################################")
         return None
-    return result
+    except Exception as e:
+        raise e
+    
 
 
 async def producer(q, records):
@@ -194,8 +221,8 @@ async def producer(q, records):
             break
         await q.put(record)
         await asyncio.sleep(0.01)
-        print(".", end="")
-        sys.stdout.flush()
+        # print(".", end="")
+        # sys.stdout.flush()
     
     await q.join()
     await q.put(None)  # poison pill
@@ -210,10 +237,10 @@ async def consumer(q, session):
             print("x")
             q.task_done()
             break
-        print("?")
+        # print("?")
         md_to_db = await process_metadata(item, session)
         
-        print("!", end="")
+        # print("!", end="")
         await asyncio.sleep(0.05)
         sys.stdout.flush()
         q.task_done()
@@ -226,8 +253,8 @@ async def main():
     sickle = Sickle('https://zenodo.org/oai2d')
 
     # Period to harvest
-    start_date = date(2024, 1, 1)
-    end_date = date(2024, 1, 31)
+    start_date = date(2024, 8, 1)
+    end_date = date(2024, 12, 31)
     dates = generate_dates(start_date, end_date)
 
     engine = create_async_engine(DATABASE_URL, echo=False)
