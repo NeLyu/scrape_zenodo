@@ -47,8 +47,6 @@ class ZenodoRecord(Base):
     source = Column(Text)
     contributor = Column(Text)
 
-# Base.metadata.create_all(engine)
-
 # Function written by @batukav
 def retry_with_exponential_backoff(max_attempts=500, delay_seconds=1):
     """
@@ -85,9 +83,6 @@ def retry_with_exponential_backoff(max_attempts=500, delay_seconds=1):
                     # Check if the error is a client error (4xx) which is not likely to be resolved by a retry.
                     if 400 <= status < 500:
                         print(f"Function {func.__name__} failed with non-retriable client error {status}: {reason}")
-                        # logger.error(
-                        #     f"Function {func.__name__} failed with non-retriable client error {e.code}: {e.reason}"
-                        # )
                         raise e  # Re-raise the HTTPError immediately
 
                     # For other errors (like 5xx server errors), proceed with retry logic.
@@ -99,7 +94,6 @@ def retry_with_exponential_backoff(max_attempts=500, delay_seconds=1):
                         requests.exceptions.Timeout,
                         urllib.error.URLError,
                         socket.timeout) as e:
-                        # logger.warning(f"{func.__name__} network error: {e}, retrying...")
                         print(f"{func.__name__} network error: {e}, retrying...")
 
                 # --- Existing retry logic ---
@@ -107,16 +101,10 @@ def retry_with_exponential_backoff(max_attempts=500, delay_seconds=1):
                 if attempts < max_attempts:
                     print(f"Attempt {attempts}/{max_attempts} for {func.__name__} failed. ")
                     print(f"Retrying in {current_delay:.1f} seconds...")
-                    # logger.warning(
-                    #     f"Attempt {attempts}/{max_attempts} for {func.__name__} failed. "
-                    #     f"Retrying in {current_delay:.1f} seconds..."
-                    # )
+                    
                     time.sleep(current_delay)
                     current_delay *= 2
                 else:
-                    # logger.error(
-                    #     f"Function {func.__name__} failed after {max_attempts} attempts."
-                    # )
                     print(f"Function {func.__name__} failed after {max_attempts} attempts.")
                     # Re-raise the last exception caught to be handled by the caller
                     raise ConnectionError(
@@ -127,7 +115,6 @@ def retry_with_exponential_backoff(max_attempts=500, delay_seconds=1):
 
 
 def generate_dates(start_date, end_date):
-    # Generate dates in daily steps
     current_date = start_date
     daily_dates = []
     while current_date <= end_date:
@@ -143,20 +130,17 @@ def to_string(array):
 async def add_record(for_db, async_session):
     try:
         async with async_session() as session:
-            # async with session.begin():
-                # print("try")
-                # record = session.query(ZenodoRecord).filter_by(identifier=for_db['identifier']).first()
-                record = insert(ZenodoRecord).values([for_db])
-                # print("q")
-                for_db_no_id = for_db.copy()
-                for_db_no_id.pop("identifier")
-                # If conflict on id → update name
-                upsert_record = record.on_conflict_do_update(
-                    index_elements=["identifier"],  # conflict target
-                    set_=for_db_no_id,  # update if conflict
-                )
-                await session.execute(upsert_record)
-                await session.commit()
+            record = insert(ZenodoRecord).values([for_db])
+            
+            for_db_no_id = for_db.copy()
+            for_db_no_id.pop("identifier")
+            # If conflict on id → update name
+            upsert_record = record.on_conflict_do_update(
+                index_elements=["identifier"],  # conflict target
+                set_=for_db_no_id,  # update if conflict
+            )
+            await session.execute(upsert_record)
+            await session.commit()
 
     except Exception as e:
         print("Failed query")
@@ -195,7 +179,6 @@ async def process_metadata(rcd, async_session):
     record["description"] = clean_description
 
     await add_record(record, async_session)
-    # print("added")
     return record
     
 
@@ -221,8 +204,6 @@ async def producer(q, records):
             break
         await q.put(record)
         await asyncio.sleep(0.01)
-        # print(".", end="")
-        # sys.stdout.flush()
     
     await q.join()
     await q.put(None)  # poison pill
@@ -237,10 +218,8 @@ async def consumer(q, session):
             print("x")
             q.task_done()
             break
-        # print("?")
         md_to_db = await process_metadata(item, session)
         
-        # print("!", end="")
         await asyncio.sleep(0.05)
         sys.stdout.flush()
         q.task_done()
